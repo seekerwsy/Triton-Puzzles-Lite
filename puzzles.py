@@ -216,6 +216,9 @@ def add_kernel(x_ptr, z_ptr, N0, B0: tl.constexpr):
     off_x = tl.arange(0, B0)
     x = tl.load(x_ptr + off_x)
     # Finish me!
+    z = x + 10.0
+    tl.store(z_ptr + off_x, z)
+
     return
 
 
@@ -237,6 +240,12 @@ def add2_spec(x: Float32[200,]) -> Float32[200,]:
 @triton.jit
 def add_mask2_kernel(x_ptr, z_ptr, N0, B0: tl.constexpr):
     # Finish me!
+    pid = tl.program_id(0)
+    off_x = tl.arange(0, B0) + pid * B0
+    x = tl.load(x_ptr + off_x, off_x < N0, 0.0)
+    z = x + 10.0
+    tl.store(z_ptr + off_x, z, off_x < N0)
+
     return
 
 
@@ -260,6 +269,25 @@ def add_vec_spec(x: Float32[32,], y: Float32[32,]) -> Float32[32, 32]:
 @triton.jit
 def add_vec_kernel(x_ptr, y_ptr, z_ptr, N0, N1, B0: tl.constexpr, B1: tl.constexpr):
     # Finish me!
+    # 加载整个 x 向量
+    off_x = tl.arange(0, B0)    # [0, 1, 2, ..., N0-1]
+    x = tl.load(x_ptr + off_x)  # (N0,)
+    
+    # 加载整个 y 向量  
+    off_y = tl.arange(0, B1)    # [0, 1, 2, ..., N1-1]
+    y = tl.load(y_ptr + off_y)  # (N1,)
+    
+    # 通过广播进行外积加法
+    z = x[None, :] + y[:, None]  # (N1, N0)
+    
+    # 计算二维存储偏移
+    i_range = tl.arange(0, B1)[:, None]  # (N1, 1)
+    j_range = tl.arange(0, B0)[None, :]  # (1, N0)
+    off_z = i_range * N0 + j_range       # (N1, N0)
+    
+    # 存储结果
+    tl.store(z_ptr + off_z, z)
+
     return
 
 
@@ -287,6 +315,19 @@ def add_vec_block_kernel(
     block_id_x = tl.program_id(0)
     block_id_y = tl.program_id(1)
     # Finish me!
+    off_x = tl.arange(0, B0) + block_id_x * B0
+    off_y = tl.arange(0, B1) + block_id_y * B1
+    x = tl.load(x_ptr + off_x, off_x < N0, 0)
+    y = tl.load(y_ptr + off_y, off_y < N1, 0)
+    
+    z = x[None, :] + y[:, None]
+
+    i_range = tl.arange(0, B1)[:, None] + block_id_y * B1 # (B1, 1), y
+    j_range = tl.arange(0, B0)[None, :] + block_id_x * B0 # (1, B0), x
+    off_z = i_range * N0 + j_range
+
+    tl.store(z_ptr + off_z, z, (i_range < N1) & (j_range < N0))
+
     return
 
 
@@ -314,6 +355,18 @@ def mul_relu_block_kernel(
     block_id_x = tl.program_id(0)
     block_id_y = tl.program_id(1)
     # Finish me!
+    off_x = tl.arange(0, B0) + block_id_x * B0
+    off_y = tl.arange(0, B1) + block_id_y * B1
+    x = tl.load(x_ptr + off_x, off_x < N0, 0)
+    y = tl.load(y_ptr + off_y, off_y < N1, 0)
+
+    product = x[None, :] * y[:, None]
+    z = tl.where(product > 0, product, 0.0)
+
+    i_range = tl.arange(0, B1)[:, None] + block_id_y * B1 # (B1, 1), y
+    j_range = tl.arange(0, B0)[None, :] + block_id_x * B0 # (1, B0), x
+    off_z = i_range * N0 + j_range  # (B1, B0)
+    tl.store(z_ptr + off_z, z, (i_range < N1) & (j_range < N0))
     return
 
 
@@ -354,6 +407,24 @@ def mul_relu_block_back_kernel(
     block_id_i = tl.program_id(0)
     block_id_j = tl.program_id(1)
     # Finish me!
+
+    off_y = tl.arange(0, B1) + block_id_j * B1
+
+    y = tl.load(y_ptr + off_y, off_y < N1, 0)
+
+    i_range = tl.arange(0, B1)[:, None] + block_id_j * B1
+    j_range = tl.arange(0, B0)[None, :] + block_id_i * B0
+    off_matrix = i_range * N0 + j_range
+
+    x = tl.load(x_ptr + off_matrix, (i_range < N1) & (j_range < N0), 0)
+    dz = tl.load(dz_ptr + off_matrix, (i_range < N1) & (j_range < N0), 0)
+
+    product = x * y[:, None]
+    # dx = (product > 0) ? y * dz : 0
+    dx = tl.where(product > 0, y[:, None] * dz, 0.0)
+
+    tl.store(dx_ptr + off_matrix, dx, (i_range < N1) & (j_range < N0))
+
     return
 
 
@@ -379,6 +450,32 @@ def sum_spec(x: Float32[4, 200]) -> Float32[4,]:
 @triton.jit
 def sum_kernel(x_ptr, z_ptr, N0, N1, T, B0: tl.constexpr, B1: tl.constexpr):
     # Finish me!
+    batch_id = tl.program_id(0)
+    
+    # 计算当前批次的起始偏移
+    batch_offset = batch_id * T  # 每行有 T 个元素
+    
+    # 初始化累加器
+    acc = tl.zeros((B1,), dtype=tl.float32)
+    
+    # 使用 for 循环处理这一行的所有元素
+    for i in range(0, T, B1):  # 每次处理 B1 个元素
+        # 计算当前块的偏移
+        off_x = tl.arange(0, B1) + i  # 当前块在行内的偏移
+        
+        # 加载数据
+        x_chunk = tl.load(x_ptr + batch_offset + off_x, off_x < T, 0.0)
+        
+        # 累加
+        acc += x_chunk
+    
+    # 对块内所有元素求和
+    result = tl.sum(acc)
+    
+    # 存储结果
+    tl.store(z_ptr + batch_id, result)
+    
+
     return
 
 
@@ -420,6 +517,50 @@ def softmax_kernel(x_ptr, z_ptr, N0, N1, T, B0: tl.constexpr, B1: tl.constexpr):
     block_id_i = tl.program_id(0)
     log2_e = 1.44269504
     # Finish me!
+    # 检查是否超出批次边界
+    if block_id_i >= N0:
+        return
+
+    # 计算当前行的起始偏移
+    row_offset = block_id_i * T
+    
+    # 第1个循环：同时找最大值和计算部分和
+    max_val = float('-inf')
+    sum_exp = 0.0
+    
+    # 存储所有的块数据，避免重复加载
+    chunks = []
+    
+    for i in range(0, T, B1):
+        off_x = tl.arange(0, B1) + i
+        mask = off_x < T
+        x_chunk = tl.load(x_ptr + row_offset + off_x, mask, float('-inf'))
+        
+        # 更新最大值
+        chunk_max = tl.max(tl.where(mask, x_chunk, float('-inf')))
+        old_max = max_val
+        max_val = tl.maximum(max_val, chunk_max)
+        
+        # 使用数学恒等式重新计算之前的和
+        # exp(x - new_max) = exp(x - old_max) * exp(old_max - new_max)
+        if i > 0:
+            correction = tl.exp2(log2_e * (old_max - max_val))
+            sum_exp *= correction
+        
+        # 计算当前块的贡献
+        exp_chunk = tl.exp2(log2_e * (x_chunk - max_val))
+        exp_chunk = tl.where(mask, exp_chunk, 0.0)
+        sum_exp += tl.sum(exp_chunk)
+        
+        # 存储块数据供后续使用
+        chunks.append((x_chunk, mask, off_x))
+    
+    # 第2个循环：计算并存储最终结果
+    for x_chunk, mask, off_x in chunks:
+        exp_chunk = tl.exp2(log2_e * (x_chunk - max_val))
+        softmax_chunk = exp_chunk / sum_exp
+        tl.store(z_ptr + row_offset + off_x, softmax_chunk, mask)
+    
     return
 
 
@@ -431,6 +572,37 @@ def softmax_kernel_brute_force(
     block_id_i = tl.program_id(0)
     log2_e = 1.44269504
     # Finish me!
+    row_offset = block_id_i * T
+    
+    # 第1个循环：找到最大值
+    max_val = float('-inf')
+    for i in range(0, T, B1):
+        off_x = tl.arange(0, B1) + i
+        mask = off_x < T
+        x_chunk = tl.load(x_ptr + row_offset + off_x, mask, float('-inf'))
+        chunk_max = tl.max(x_chunk)
+        max_val = tl.maximum(max_val, chunk_max)
+    
+    # 第2个循环：计算 exp(x - max) 的和
+    sum_exp = 0.0
+    for i in range(0, T, B1):
+        off_x = tl.arange(0, B1) + i
+        mask = off_x < T
+        x_chunk = tl.load(x_ptr + row_offset + off_x, mask, 0.0)
+        # 使用 exp2(log2_e * x) 替代 exp(x)
+        exp_chunk = tl.exp2(log2_e * (x_chunk - max_val))
+        exp_chunk = tl.where(mask, exp_chunk, 0.0)
+        sum_exp += tl.sum(exp_chunk)
+    
+    # 第3个循环：计算最终的 softmax 值并存储
+    for i in range(0, T, B1):
+        off_x = tl.arange(0, B1) + i
+        mask = off_x < T
+        x_chunk = tl.load(x_ptr + row_offset + off_x, mask, 0.0)
+        exp_chunk = tl.exp2(log2_e * (x_chunk - max_val))
+        softmax_chunk = exp_chunk / sum_exp
+        tl.store(z_ptr + row_offset + off_x, softmax_chunk, mask)
+    
     return
 
 
@@ -502,6 +674,47 @@ def conv2d_kernel(
 ):
     block_id_i = tl.program_id(0)
     # Finish me!
+    # 计算batch偏移（向量化处理多个batch）
+    off_i = block_id_i * B0 + tl.arange(0, B0)
+    mask_i = off_i < N0
+
+    # 预计算卷积核的偏移
+    off_h = tl.arange(0, KH)  # [0, 1, 2, 3]
+    off_w = tl.arange(0, KW)  # [0, 1, 2, 3]
+    off_hw = off_h[:, None] * KW + off_w[None, :]  # [KH, KW] 卷积核的2D偏移
+
+    # 一次性加载整个卷积核
+    k = tl.load(k_ptr + off_hw)
+
+    # 遍历输出特征图的每个位置
+    for j in tl.range(0, H):  # 输出高度
+        for l in tl.range(0, W):  # 输出宽度
+            
+            # 计算输入图像中对应的位置范围
+            off_j_oj = j + off_h[None, :, None]  # [1, KH, 1] -> [B0, KH, KW]
+            off_l_ol = l + off_w[None, None, :]  # [1, 1, KW] -> [B0, KH, KW]
+            
+            # 计算输入数据的线性偏移
+            # off_i[:, None, None] 扩展为 [B0, 1, 1] -> [B0, KH, KW]
+            off_x = off_i[:, None, None] * H * W + off_j_oj * W + off_l_ol
+            
+            # 边界检查（隐式zero padding）
+            mask_x = (off_j_oj < H) & (off_l_ol < W) & mask_i[:, None, None]
+            
+            # 加载输入数据块 [B0, KH, KW]
+            x = tl.load(x_ptr + off_x, mask=mask_x, other=0.0)
+
+            # 执行卷积运算（element-wise乘法然后求和）
+            # k[None, :, :] 扩展为 [1, KH, KW] -> [B0, KH, KW]
+            conv_result = x * k[None, :, :]  # [B0, KH, KW]
+            
+            # 分步求和：先对 KW 维度求和，再对 KH 维度求和
+            z = tl.sum(tl.sum(conv_result, axis=2), axis=1)  # [B0]
+
+            # 计算输出偏移并存储结果
+            off_z = off_i * H * W + j * W + l
+            tl.store(z_ptr + off_z, z, mask=mask_i)
+
     return
 
 
@@ -548,6 +761,42 @@ def dot_kernel(
     block_id_k = tl.program_id(1)
     block_id_i = tl.program_id(2)
     # Finish me!
+    # 计算当前块的起始位置
+    start_j = block_id_j * B0
+    start_k = block_id_k * B1
+    start_i = block_id_i * B2
+    
+    # 创建索引范围
+    offs_j = start_j + tl.arange(0, B0)
+    offs_k = start_k + tl.arange(0, B1)
+    offs_i = start_i + tl.arange(0, B2)
+    
+    # 初始化累加器
+    accumulator = tl.zeros((B2, B0, B1), dtype=tl.float32)
+    
+    # 沿着 MID 维度进行分块累加
+    for mid_start in range(0, MID, B_MID):
+        offs_mid = mid_start + tl.arange(0, B_MID)
+        
+        # 构建内存访问掩码
+        mask_x = (offs_i[:, None, None] < N2) & (offs_j[None, :, None] < N0) & (offs_mid[None, None, :] < MID)
+        mask_y = (offs_i[:, None, None] < N2) & (offs_mid[None, :, None] < MID) & (offs_k[None, None, :] < N1)
+        
+        # 计算内存偏移
+        x_offsets = offs_i[:, None, None] * N0 * MID + offs_j[None, :, None] * MID + offs_mid[None, None, :]
+        y_offsets = offs_i[:, None, None] * MID * N1 + offs_mid[None, :, None] * N1 + offs_k[None, None, :]
+        
+        # 加载数据块
+        x_block = tl.load(x_ptr + x_offsets, mask=mask_x, other=0.0)
+        y_block = tl.load(y_ptr + y_offsets, mask=mask_y, other=0.0)
+        
+        # 执行分块矩阵乘法并累加
+        accumulator += tl.dot(x_block, y_block)
+    
+    # 存储结果
+    mask_z = (offs_i[:, None, None] < N2) & (offs_j[None, :, None] < N0) & (offs_k[None, None, :] < N1)
+    z_offsets = offs_i[:, None, None] * N0 * N1 + offs_j[None, :, None] * N1 + offs_k[None, None, :]
+    tl.store(z_ptr + z_offsets, accumulator, mask=mask_z)
     return
 
 
@@ -614,6 +863,7 @@ def quant_dot_kernel(
     block_id_j = tl.program_id(0)
     block_id_k = tl.program_id(1)
     # Finish me!
+
     return
 
 
